@@ -1,5 +1,6 @@
 # ESPHome BLE gateway for Żabka Triki (nRF52810 + LSM6DSL)
 # Protocol: https://github.com/Maku-hub/TrikiScope
+# https://github.com/pawelczykkacper/triki-gateway
 
 substitutions:
   name: triki-gateway
