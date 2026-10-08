@@ -1,0 +1,429 @@
+# ESPHome BLE gateway for Żabka Triki (nRF52810 + LSM6DSL)
+# Protocol: https://github.com/Maku-hub/TrikiScope
+
+substitutions:
+  name: triki-gateway
+  friendly_name: Triki Gateway
+  triki_mac: "XX:XX:XX:XX:XX:XX"
+  gyro_scale: "131.0"
+  accel_scale: "2048.0"
+  imu_publish_ms: "200"   # 5 Hz to Home Assistant
+  startup_discard: "20"
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+logger:
+  level: INFO
+  logs:
+    triki: INFO
+api:
+
+ota:
+  platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name}"
+    password: !secret wifi_password
+
+captive_portal:
+# --- BLE central (not bluetooth_proxy: HA has no Triki integration) ---
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 320ms
+    window: 160ms
+    active: true
+  on_ble_advertise:
+    then:
+      - lambda: |-
+          auto name = x.get_name();
+          if (name.find("Triki") != std::string::npos) {
+            ESP_LOGI("triki", "Found %s  %s  RSSI %d",
+                     name.c_str(), x.address_str().c_str(), x.get_rssi());
+          }
+ble_client:
+  - mac_address: ${triki_mac}
+    id: triki_ble
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: |-
+            id(g_discard) = 0;
+            id(g_press_count) = 0;
+            id(g_last_btn) = false;
+            ESP_LOGI("triki", "Connected, starting IMU stream");
+        - delay: 500ms
+        - ble_client.ble_write:
+            id: triki_ble
+            service_uuid: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+            characteristic_uuid: 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
+            # Zappka / TrikiScope start command
+            value: [0x20, 0x10, 0x00, 0xD0, 0x07, 0x68, 0x00, 0x03]
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(triki_button).publish_state(false);
+            id(triki_gesture).publish_state("");
+            ESP_LOGW("triki", "Disconnected");
+globals:
+  - id: g_discard
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: g_press_count
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: g_last_btn
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: g_ff_run
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: g_shake_run
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: g_last_gesture_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+switch:
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Connect"
+    id: triki_connect
+    icon: mdi:bluetooth-connect
+    entity_category: config
+  - platform: template
+    name: "LED"
+    id: triki_led
+    icon: mdi:led-on
+    optimistic: true
+    assumed_state: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - ble_client.ble_write:
+          id: triki_ble
+          service_uuid: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+          characteristic_uuid: 6E400004-B5A3-F393-E0A9-E50E24DCCA9E
+          value: [0x01]
+    turn_off_action:
+      - ble_client.ble_write:
+          id: triki_ble
+          service_uuid: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+          characteristic_uuid: 6E400004-B5A3-F393-E0A9-E50E24DCCA9E
+          value: [0x00]
+button:
+  - platform: template
+    name: "Start IMU stream"
+    id: triki_start_stream
+    icon: mdi:play
+    entity_category: config
+    on_press:
+      - ble_client.ble_write:
+          id: triki_ble
+          service_uuid: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+          characteristic_uuid: 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
+          value: [0x20, 0x10, 0x00, 0xD0, 0x07, 0x68, 0x00, 0x03]
+  - platform: template
+    name: "Reset press count"
+    icon: mdi:counter
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(g_press_count) = 0;
+          id(triki_presses).publish_state(0);
+binary_sensor:
+  - platform: template
+    name: "Button"
+    id: triki_button
+    device_class: occupancy
+    icon: mdi:gesture-tap-button
+#  - platform: ble_client
+#    ble_client_id: triki_ble
+#    name: "Connected"
+#    device_class: connectivity
+#    entity_category: diagnostic
+    
+text_sensor:
+  - platform: template
+    name: "Gesture"
+    id: triki_gesture
+    icon: mdi:gesture-swipe
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: "return !x.empty();"
+            then:
+              - homeassistant.event:
+                  event: esphome.triki_gesture
+                  data:
+                    gesture: !lambda "return x;"
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Firmware"
+    service_uuid: "180A"
+    characteristic_uuid: "2A26"
+    entity_category: diagnostic
+    icon: mdi:chip
+    update_interval: 24h
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Hardware"
+    service_uuid: "180A"
+    characteristic_uuid: "2A27"
+    entity_category: diagnostic
+    update_interval: 24h
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Software"
+    service_uuid: "180A"
+    characteristic_uuid: "2A28"
+    entity_category: diagnostic
+    update_interval: 24h
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Manufacturer"
+    service_uuid: "180A"
+    characteristic_uuid: "2A29"
+    entity_category: diagnostic
+    update_interval: 24h
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Model"
+    service_uuid: "180A"
+    characteristic_uuid: "2A24"
+    entity_category: diagnostic
+    update_interval: 24h
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Serial"
+    service_uuid: "180A"
+    characteristic_uuid: "2A25"
+    entity_category: diagnostic
+    update_interval: 24h
+  - platform: ble_client
+    ble_client_id: triki_ble
+    name: "Device name"
+    service_uuid: "1800"
+    characteristic_uuid: "2A00"
+    entity_category: diagnostic
+    update_interval: 24h
+sensor:
+  - platform: ble_client
+    type: rssi
+    ble_client_id: triki_ble
+    name: "RSSI"
+    device_class: signal_strength
+    entity_category: diagnostic
+    update_interval: 30s
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: triki_ble
+    name: "Battery"
+    service_uuid: "180F"
+    characteristic_uuid: "2A19"
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+    notify: true
+    update_interval: 60s
+    lambda: |-
+      if (x.empty()) return NAN;
+      return (float) x[0];
+  # Hidden NUS TX parser — all IMU / button / gesture logic lives here
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: triki_ble
+    id: triki_nus_tx
+    internal: true
+    notify: true
+    update_interval: never
+    service_uuid: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+    characteristic_uuid: 6E400003-B5A3-F393-E0A9-E50E24DCCA9E
+    lambda: |-
+      static std::vector<uint8_t> buf;
+      buf.insert(buf.end(), x.begin(), x.end());
+      auto le16 = [](const uint8_t *p) -> int16_t {
+        return (int16_t) ((uint16_t) p[0] | ((uint16_t) p[1] << 8));
+      };
+      const float gyro_s = ${gyro_scale};
+      const float accel_s = ${accel_scale};
+      const uint32_t pub_ms = ${imu_publish_ms};
+      static uint32_t last_pub = 0;
+      while (true) {
+        int hdr = -1;
+        for (size_t i = 0; i + 1 < buf.size(); i++) {
+          if (buf[i] == 0x22 && (buf[i + 1] == 0x00 || buf[i + 1] == 0x01)) {
+            hdr = (int) i;
+            break;
+          }
+        }
+        if (hdr < 0) {
+          if (!buf.empty() && buf.back() == 0x22) {
+            uint8_t t = buf.back();
+            buf.clear();
+            buf.push_back(t);
+          } else {
+            buf.clear();
+          }
+          break;
+        }
+        if (hdr > 0)
+          buf.erase(buf.begin(), buf.begin() + hdr);
+        if (buf.size() < 14)
+          break;
+        uint8_t status = buf[1];
+        float gx = le16(&buf[2]) / gyro_s;
+        float gy = le16(&buf[4]) / gyro_s;
+        float gz = le16(&buf[6]) / gyro_s;
+        float ax = le16(&buf[8]) / accel_s;
+        float ay = le16(&buf[10]) / accel_s;
+        float az = le16(&buf[12]) / accel_s;
+        buf.erase(buf.begin(), buf.begin() + 14);
+        if (id(g_discard) < ${startup_discard}) {
+          id(g_discard) += 1;
+          continue;
+        }
+        bool btn = status & 0x01;
+        if (btn && !id(g_last_btn)) {
+          id(g_press_count) += 1;
+          id(triki_presses).publish_state(id(g_press_count));
+        }
+        if (btn != id(g_last_btn))
+          id(triki_button).publish_state(btn);
+        id(g_last_btn) = btn;
+        float amag = sqrtf(ax * ax + ay * ay + az * az);
+        float gmag = sqrtf(gx * gx + gy * gy + gz * gz);
+        id(g_ff_run) = (amag < 0.35f) ? id(g_ff_run) + 1 : 0;
+        id(g_shake_run) = (gmag > 300.0f) ? id(g_shake_run) + 1 : 0;
+        uint32_t now = millis();
+        if (now - id(g_last_gesture_ms) >= 400) {
+          const char *gname = nullptr;
+          if (amag > 2.5f)
+            gname = "tap";
+          else if (id(g_ff_run) >= 2)
+            gname = "throw";
+          else if (id(g_shake_run) >= 4)
+            gname = "shake";
+          else {
+            float axis = fmaxf(fabsf(gx), fmaxf(fabsf(gy), fabsf(gz)));
+            if (axis > 250.0f)
+              gname = "spin";
+          }
+          if (gname != nullptr) {
+            id(g_last_gesture_ms) = now;
+            id(triki_gesture).publish_state(gname);
+            id(clear_gesture).execute();
+          }
+        }
+        if (now - last_pub >= pub_ms) {
+          last_pub = now;
+          id(triki_gyro_x).publish_state(gx);
+          id(triki_gyro_y).publish_state(gy);
+          id(triki_gyro_z).publish_state(gz);
+          id(triki_accel_x).publish_state(ax);
+          id(triki_accel_y).publish_state(ay);
+          id(triki_accel_z).publish_state(az);
+          id(triki_gyro_mag).publish_state(gmag);
+          id(triki_accel_mag).publish_state(amag);
+          float pitch = atan2f(ay, az) * 180.0f / M_PI;
+          float roll = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / M_PI;
+          id(triki_pitch).publish_state(pitch);
+          id(triki_roll).publish_state(roll);
+        }
+      }
+      return NAN;
+  - platform: template
+    name: "Gyro X"
+    id: triki_gyro_x
+    unit_of_measurement: "°/s"
+    accuracy_decimals: 1
+    icon: mdi:rotate-orbit
+    update_interval: never
+  - platform: template
+    name: "Gyro Y"
+    id: triki_gyro_y
+    unit_of_measurement: "°/s"
+    accuracy_decimals: 1
+    icon: mdi:rotate-orbit
+    update_interval: never
+  - platform: template
+    name: "Gyro Z"
+    id: triki_gyro_z
+    unit_of_measurement: "°/s"
+    accuracy_decimals: 1
+    icon: mdi:rotate-orbit
+    update_interval: never
+  - platform: template
+    name: "Gyro magnitude"
+    id: triki_gyro_mag
+    unit_of_measurement: "°/s"
+    accuracy_decimals: 1
+    icon: mdi:rotate-3d-variant
+    update_interval: never
+  - platform: template
+    name: "Accel X"
+    id: triki_accel_x
+    unit_of_measurement: "g"
+    accuracy_decimals: 3
+    icon: mdi:axis-x-arrow
+    update_interval: never
+  - platform: template
+    name: "Accel Y"
+    id: triki_accel_y
+    unit_of_measurement: "g"
+    accuracy_decimals: 3
+    icon: mdi:axis-y-arrow
+    update_interval: never
+  - platform: template
+    name: "Accel Z"
+    id: triki_accel_z
+    unit_of_measurement: "g"
+    accuracy_decimals: 3
+    icon: mdi:axis-z-arrow
+    update_interval: never
+  - platform: template
+    name: "Accel magnitude"
+    id: triki_accel_mag
+    unit_of_measurement: "g"
+    accuracy_decimals: 3
+    icon: mdi:axis-arrow
+    update_interval: never
+  - platform: template
+    name: "Pitch"
+    id: triki_pitch
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+    icon: mdi:angle-acute
+    update_interval: never
+  - platform: template
+    name: "Roll"
+    id: triki_roll
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+    icon: mdi:angle-acute
+    update_interval: never
+  - platform: template
+    name: "Button presses"
+    id: triki_presses
+    accuracy_decimals: 0
+    icon: mdi:counter
+    update_interval: never
+script:
+  - id: clear_gesture
+    mode: restart
+    then:
+      - delay: 800ms
+      - text_sensor.template.publish:
+          id: triki_gesture
+          state: ""
